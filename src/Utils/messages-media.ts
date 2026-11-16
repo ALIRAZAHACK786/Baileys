@@ -271,7 +271,8 @@ export async function getAudioWaveform(buffer: Buffer | string | Readable, logge
 			const blockStart = blockSize * i // the location of the first sample in the block
 			let sum = 0
 			for (let j = 0; j < blockSize; j++) {
-				sum = sum + Math.abs(rawData[blockStart + j]) // find the sum of all the samples in the block
+				// index is in-bounds by construction (blockSize * 64 <= length); ?? 0 satisfies strict indexing
+				sum = sum + Math.abs(rawData[blockStart + j] ?? 0) // find the sum of all the samples in the block
 			}
 
 			filteredData.push(sum / blockSize) // divide the sum by the block size to get the average
@@ -692,6 +693,7 @@ type MediaUploadResult = {
 	meta_hmac?: string
 	ts?: number
 	fbid?: number
+	handle?: string
 	thumbnail_info?: {
 		thumbnail_sha256?: string
 		thumbnail_direct_path?: string
@@ -855,6 +857,7 @@ export const getWAUploadToServer = (
 					fbid?: number
 					thumbnailDirectPath?: string
 					thumbnailSha256?: string
+					handle?: string
 			  }
 			| undefined
 		const hosts = [...customUploadHosts, ...uploadInfo.hosts]
@@ -879,13 +882,9 @@ export const getWAUploadToServer = (
 
 			const auth = encodeURIComponent(uploadInfo.auth)
 			const mediaPath = (newsletter ? NEWSLETTER_MEDIA_PATH_MAP[mediaType] : undefined) || MEDIA_PATH_MAP[mediaType]
-			let url = `https://${hostname}${mediaPath}/${fileEncSha256B64}?auth=${auth}&token=${fileEncSha256B64}`
-			if (newsletter) {
-				url += '&server_thumb_gen=1'
-				if (mediaType === 'video' || mediaType === 'gif' || mediaType === 'ptv') {
-					url += '&server_transcode=1'
-				}
-			}
+			// Newsletter uploads use the same query as normal uploads: the
+			// reference client (whatsmeow) sends no extra params here.
+			const url = `https://${hostname}${mediaPath}/${fileEncSha256B64}?auth=${auth}&token=${fileEncSha256B64}`
 
 			let result: MediaUploadResult | undefined
 			try {
@@ -908,7 +907,8 @@ export const getWAUploadToServer = (
 						fbid: result.fbid,
 						ts: result.ts,
 						thumbnailDirectPath: result.thumbnail_info?.thumbnail_direct_path,
-						thumbnailSha256: result.thumbnail_info?.thumbnail_sha256
+						thumbnailSha256: result.thumbnail_info?.thumbnail_sha256,
+						handle: result.handle
 					}
 					break
 				} else {
@@ -930,6 +930,48 @@ export const getWAUploadToServer = (
 
 		return urls
 	}
+}
+
+// Newsletter media handles: a newsletter upload returns a `handle` that the
+// server expects as the `media_id` attribute on the <message> stanza. Without
+// it the post appears but the media never plays (whatsmeow passes it as
+// SendRequestExtra.MediaHandle). prepareWAMessageMedia records the handle
+// keyed by directPath; relayMessage reads it back when sending the stanza.
+// Entries expire after 10 minutes so a failed send cannot leak memory.
+const NEWSLETTER_MEDIA_HANDLE_TTL_MS = 10 * 60 * 1000
+const NEWSLETTER_MEDIA_HANDLE_MAX = 100
+const newsletterMediaHandles = new Map<string, { handle: string; at: number }>()
+
+export const setNewsletterMediaHandle = (directPath: string, handle: string) => {
+	const now = Date.now()
+	for (const [key, value] of newsletterMediaHandles) {
+		if (now - value.at > NEWSLETTER_MEDIA_HANDLE_TTL_MS) {
+			newsletterMediaHandles.delete(key)
+		}
+	}
+
+	if (newsletterMediaHandles.size >= NEWSLETTER_MEDIA_HANDLE_MAX) {
+		const oldest = newsletterMediaHandles.keys().next().value
+		if (oldest) {
+			newsletterMediaHandles.delete(oldest)
+		}
+	}
+
+	newsletterMediaHandles.set(directPath, { handle, at: now })
+}
+
+export const getNewsletterMediaHandle = (directPath: string): string | undefined => {
+	const entry = newsletterMediaHandles.get(directPath)
+	if (!entry) {
+		return undefined
+	}
+
+	if (Date.now() - entry.at > NEWSLETTER_MEDIA_HANDLE_TTL_MS) {
+		newsletterMediaHandles.delete(directPath)
+		return undefined
+	}
+
+	return entry.handle
 }
 
 const getMediaRetryKey = (mediaKey: Buffer | Uint8Array) => {

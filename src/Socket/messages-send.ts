@@ -27,6 +27,7 @@ import {
 	generateMessageIDV2,
 	generateParticipantHashV2,
 	generateWAMessage,
+	getNewsletterMediaHandle,
 	getStatusCodeForMediaRetry,
 	getUrlFromDirectPath,
 	getWAUploadToServer,
@@ -687,12 +688,17 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					attrs: mediaType ? { mediatype: mediaType } : {},
 					content: bytes
 				})
+				// Newsletter media uploads return a handle that the server
+				// expects as the `media_id` attribute — without it the post
+				// appears but the media never plays (whatsmeow sendNewsletter).
+				const mediaHandle = getNewsletterMediaHandleForMessage(patched as proto.IMessage)
 				const stanza: BinaryNode = {
 					tag: 'message',
 					attrs: {
 						to: jid,
 						id: msgId,
 						type: getMessageType(message),
+						...(mediaHandle ? { media_id: mediaHandle } : {}),
 						...(additionalAttributes || {})
 					},
 					content: binaryNodeContent
@@ -1177,6 +1183,27 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		}
 
 		return 'text'
+	}
+
+	// The media handle recorded at upload time for this message's media, if any.
+	const getNewsletterMediaHandleForMessage = (message: proto.IMessage): string | undefined => {
+		const normalized = normalizeMessageContent(message)
+		const mediaKeys = [
+			'audioMessage',
+			'videoMessage',
+			'imageMessage',
+			'documentMessage',
+			'stickerMessage',
+			'ptvMessage'
+		] as const
+		for (const key of mediaKeys) {
+			const media = normalized?.[key] as { directPath?: string } | undefined
+			if (media?.directPath) {
+				return getNewsletterMediaHandle(media.directPath)
+			}
+		}
+
+		return undefined
 	}
 
 	const getMediaType = (message: proto.IMessage) => {

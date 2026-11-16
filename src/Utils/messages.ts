@@ -37,6 +37,8 @@ import {
 	generateThumbnail,
 	getAudioDuration,
 	getAudioWaveform,
+	getRawMediaUploadData,
+	setNewsletterMediaHandle,
 	type MediaDownloadOptions
 } from './messages-media'
 import { shouldIncludeReportingToken } from './reporting-utils'
@@ -174,109 +176,101 @@ export const prepareWAMessageMedia = async (
 
 	const isNewsletter = !!options.jid && isJidNewsletter(options.jid)
 	if (isNewsletter) {
-		logger?.info({ key: cacheableKey }, 'Preparing encrypted media for newsletter')
-		// Channel media is encrypted exactly like normal media: the WhatsApp
-		// client decrypts EVERY media message with mediaKey (see
-		// downloadContentFromMessage — no raw-media path exists). Only the
-		// CDN upload path differs (/newsletter/*). Uploading raw bytes makes
-		// the post appear but the media can never play ("something is wrong
-		// with the audio file"), because the message carries no mediaKey and
-		// no fileEncSha256.
+		logger?.info({ key: cacheableKey }, 'Preparing raw media for newsletter')
+		// Newsletter media is NOT encrypted: the official client uploads raw
+		// bytes to the /newsletter/* paths and the message carries no
+		// mediaKey or fileEncSha256 (whatsmeow UploadNewsletter). The upload
+		// response carries a `handle` that must be sent as the `media_id`
+		// attribute on the <message> stanza — without it the post appears
+		// but the media never plays. The handle is recorded keyed by
+		// directPath for relayMessage to pick up; duration / waveform /
+		// thumbnail are computed from the raw file like the normal path does.
 		const requiresDurationComputation = mediaType === 'audio' && typeof uploadData.seconds === 'undefined'
 		const requiresThumbnailComputation =
 			(mediaType === 'image' || mediaType === 'video') && typeof uploadData['jpegThumbnail'] === 'undefined'
 		const requiresWaveformProcessing =
 			mediaType === 'audio' && uploadData.ptt === true && typeof uploadData.waveform === 'undefined'
 		const requiresAudioBackground = options.backgroundColor && mediaType === 'audio' && uploadData.ptt === true
-		const requiresOriginalForSomeProcessing =
-			requiresDurationComputation || requiresThumbnailComputation || requiresWaveformProcessing
-		const { mediaKey, encFilePath, originalFilePath, fileEncSha256, fileSha256, fileLength } = await encryptedStream(
+		const { filePath, fileSha256, fileLength } = await getRawMediaUploadData(
 			uploadData.media,
 			options.mediaTypeOverride || mediaType,
-			{
-				logger,
-				saveOriginalFileIfRequired: requiresOriginalForSomeProcessing,
-				opts: options.options
-			}
+			logger
 		)
 
-		const fileEncSha256B64 = fileEncSha256.toString('base64')
+		const fileSha256B64 = fileSha256.toString('base64')
+		let mediaUrl: string | undefined
 		let directPath: string | undefined
 		let thumbnailDirectPath: string | undefined
 		let thumbnailSha256: string | undefined
 		try {
-			const result = await options.upload(encFilePath, {
-				fileEncSha256B64,
+			const result = await options.upload(filePath, {
+				fileEncSha256B64: fileSha256B64,
 				mediaType,
 				timeoutMs: options.mediaUploadTimeoutMs,
 				newsletter: true
 			})
+			mediaUrl = result.mediaUrl
 			directPath = result.directPath
 			thumbnailDirectPath = result.thumbnailDirectPath
 			thumbnailSha256 = result.thumbnailSha256
+			if (result.handle && directPath) {
+				setNewsletterMediaHandle(directPath, result.handle)
+			} else {
+				logger?.warn({ mediaType, cacheableKey }, 'newsletter upload returned no media handle')
+			}
+
 			logger?.debug({ mediaType, cacheableKey }, 'uploaded newsletter media')
+
+			try {
+				if (requiresThumbnailComputation) {
+					// mediaType narrows to 'image' | 'video' via requiresThumbnailComputation (same as normal path)
+					const { thumbnail, originalImageDimensions } = await generateThumbnail(
+						filePath,
+						mediaType as 'image' | 'video',
+						options
+					)
+					uploadData.jpegThumbnail = thumbnail
+					if (!uploadData.width && originalImageDimensions) {
+						uploadData.width = originalImageDimensions.width
+						uploadData.height = originalImageDimensions.height
+						logger?.debug('set dimensions')
+					}
+
+					logger?.debug('generated thumbnail')
+				}
+
+				if (requiresDurationComputation) {
+					uploadData.seconds = await getAudioDuration(filePath)
+					logger?.debug('computed audio duration')
+				}
+
+				if (requiresWaveformProcessing) {
+					uploadData.waveform = await getAudioWaveform(filePath, logger)
+					logger?.debug('processed waveform')
+				}
+
+				if (requiresAudioBackground) {
+					uploadData.backgroundArgb = await assertColor(options.backgroundColor)
+					logger?.debug('computed backgroundColor audio status')
+				}
+			} catch (error) {
+				logger?.warn({ trace: (error as Error).stack }, 'failed to obtain extra info')
+			}
 		} finally {
 			try {
-				await fs.unlink(encFilePath)
-			} catch (error) {
-				logger?.warn('failed to remove tmp file')
-			}
-		}
-
-		// duration / waveform / thumbnail from the original file (same as normal path)
-		try {
-			if (requiresThumbnailComputation && originalFilePath) {
-				// mediaType narrows to 'image' | 'video' via requiresThumbnailComputation (same as normal path)
-				const { thumbnail, originalImageDimensions } = await generateThumbnail(
-					originalFilePath,
-					mediaType as 'image' | 'video',
-					options
-				)
-				uploadData.jpegThumbnail = thumbnail
-				if (!uploadData.width && originalImageDimensions) {
-					uploadData.width = originalImageDimensions.width
-					uploadData.height = originalImageDimensions.height
-					logger?.debug('set dimensions')
-				}
-				logger?.debug('generated thumbnail')
-			}
-
-			if (requiresDurationComputation && originalFilePath) {
-				uploadData.seconds = await getAudioDuration(originalFilePath)
-				logger?.debug('computed audio duration')
-			}
-
-			if (requiresWaveformProcessing && originalFilePath) {
-				uploadData.waveform = await getAudioWaveform(originalFilePath, logger)
-				logger?.debug('processed waveform')
-			}
-
-			if (requiresAudioBackground) {
-				uploadData.backgroundArgb = await assertColor(options.backgroundColor)
-				logger?.debug('computed backgroundColor audio status')
-			}
-		} catch (error) {
-			logger?.warn({ trace: (error as Error).stack }, 'failed to obtain extra info')
-		} finally {
-			if (originalFilePath) {
-				try {
-					await fs.unlink(originalFilePath)
-				} catch {
-					// ignore
-				}
+				await fs.unlink(filePath)
+			} catch {
+				// ignore
 			}
 		}
 
 		const obj = WAProto.Message.fromObject({
 			// todo: add more support here
 			[`${mediaType}Message`]: (MessageTypeProto as any)[mediaType].fromObject({
-				// url intentionally omitted — newsletters use directPath only
+				url: mediaUrl?.startsWith('http') ? mediaUrl : undefined,
 				directPath,
-				mediaKey,
-				fileEncSha256,
 				fileSha256,
 				fileLength,
-				mediaKeyTimestamp: unixTimestampSeconds(),
 				thumbnailDirectPath,
 				thumbnailSha256: thumbnailSha256 ? Buffer.from(thumbnailSha256, 'base64') : undefined,
 				...uploadData,

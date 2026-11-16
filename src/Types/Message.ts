@@ -357,6 +357,8 @@ export type WAMediaUploadFunction = (
 	fbid?: number
 	thumbnailDirectPath?: string
 	thumbnailSha256?: string
+	/** newsletter uploads only: server handle, sent as the `media_id` stanza attribute */
+	handle?: string
 }>
 
 export type MediaGenerationOptions = {
