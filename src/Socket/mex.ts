@@ -36,7 +36,19 @@ export const executeWMexQuery = async <T>(
 	const result = await wMexQuery(variables, queryId, query, generateMessageTag)
 	const child = getBinaryNodeChild(result, 'result')
 	if (child?.content) {
-		const data = JSON.parse(child.content.toString())
+		const contentStr = child.content.toString()
+		let data
+		try {
+			data = JSON.parse(contentStr)
+		} catch {
+			// Android returns protobuf here, not JSON — pull the JID out directly
+			const jidMatch = contentStr.match(/120363\d{10,}/)
+			if (jidMatch) {
+				return { id: `${jidMatch[0]}@newsletter` } as unknown as T
+			}
+
+			throw new Boom('Failed to parse Mex response', { statusCode: 400, data: result })
+		}
 
 		if (data.errors && data.errors.length > 0) {
 			const errorMessages = data.errors.map((err: Error) => err.message || 'Unknown error').join(', ')

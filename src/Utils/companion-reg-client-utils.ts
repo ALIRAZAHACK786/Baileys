@@ -22,12 +22,16 @@ const BROWSER_TO_COMPANION_WEB_CLIENT: Record<string, CompanionWebClientType> = 
 	Safari: CompanionWebClientType.SAFARI
 }
 
-export const getCompanionWebClientType = ([os, browserName]: WABrowserDescription): CompanionWebClientType => {
-	if (browserName === 'Desktop') {
+export const getCompanionWebClientType = (browser: WABrowserDescription): CompanionWebClientType => {
+	const [os, browserName] = browser
+	// Android identities carry the browser name in the OS slot
+	// (['Chrome', 'Android', '15']), so look the client type up from there
+	const name = browserName.toLocaleLowerCase().includes('android') ? os : browserName
+	if (name === 'Desktop') {
 		return os === 'Windows' ? CompanionWebClientType.UWP : CompanionWebClientType.ELECTRON
 	}
 
-	return BROWSER_TO_COMPANION_WEB_CLIENT[browserName] || CompanionWebClientType.OTHER_WEB_CLIENT
+	return BROWSER_TO_COMPANION_WEB_CLIENT[name] || CompanionWebClientType.OTHER_WEB_CLIENT
 }
 
 export const getCompanionPlatformId = (browser: WABrowserDescription): string => {

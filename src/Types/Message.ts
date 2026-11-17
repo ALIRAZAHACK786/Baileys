@@ -209,6 +209,8 @@ export type AnyMediaMessageContent = (
 ) & { mimetype?: string } & Editable & {
 		/** key of the parent albumMessage to associate this media with */
 		albumParentKey?: WAMessageKey
+		/** key of the status message this reaction is associated with */
+		statusReactionParentKey?: WAMessageKey
 	}
 
 export type ButtonReplyInfo = {

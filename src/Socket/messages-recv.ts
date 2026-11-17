@@ -1638,8 +1638,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 						const unavailableType = unavailableNode?.attrs?.type
 						if (
 							unavailableType === 'bot_unavailable_fanout' ||
-							unavailableType === 'hosted_unavailable_fanout' ||
-							unavailableType === 'view_once_unavailable_fanout'
+							unavailableType === 'hosted_unavailable_fanout'
 						) {
 							logger.debug(
 								{ msgId: msg.key.id, unavailableType },
@@ -1649,50 +1648,60 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 							return sendMessageAck(node)
 						}
 
-						const messageAge = unixTimestampSeconds() - toNumber(msg.messageTimestamp)
-						if (messageAge > PLACEHOLDER_MAX_AGE_SECONDS) {
-							logger.debug({ msgId: msg.key.id, messageAge }, 'skipping placeholder resend for old message')
+						if (unavailableType === 'view_once_unavailable_fanout') {
+							// the phone sent a stub instead of the media (non-Android companion):
+							// keep the stub visible instead of dropping the message entirely
+							logger.info({ msgId: msg.key.id }, 'view-once message unavailable on this platform (non-Android companion)')
+							msg.messageStubParameters = [...(msg.messageStubParameters || []), 'view_once_unavailable']
 							acked = true
-							return sendMessageAck(node)
-						}
+							await sendMessageAck(node)
+						} else {
 
-						// Request the real content from the phone via placeholder resend PDO.
-						// Upsert the CIPHERTEXT stub as a placeholder (like WA Web's processPlaceholderMsg),
-						// and store the requestId in stubParameters[1] so users can correlate
-						// with the incoming PDO response event.
-						const cleanKey: proto.IMessageKey = {
-							remoteJid: msg.key.remoteJid,
-							fromMe: msg.key.fromMe,
-							id: msg.key.id,
-							participant: msg.key.participant
-						}
-						// Cache the original message metadata so the PDO response handler
-						// can preserve key fields (LID details etc.) that the phone may omit
-						const msgData: Partial<WAMessage> = {
-							key: msg.key,
-							messageTimestamp: msg.messageTimestamp,
-							pushName: msg.pushName,
-							participant: msg.participant,
-							verifiedBizName: msg.verifiedBizName
-						}
-						requestPlaceholderResend(cleanKey, msgData)
-							.then(requestId => {
-								if (requestId && requestId !== 'RESOLVED') {
-									logger.debug({ msgId: msg.key.id, requestId }, 'requested placeholder resend for unavailable message')
-									ev.emit('messages.update', [
-										{
-											key: msg.key,
-											update: { messageStubParameters: [NO_MESSAGE_FOUND_ERROR_TEXT, requestId] }
-										}
-									])
-								}
-							})
-							.catch(err => {
-								logger.warn({ err, msgId: msg.key.id }, 'failed to request placeholder resend for unavailable message')
-							})
-						acked = true
-						await sendMessageAck(node)
-						// Don't return — fall through to upsertMessage so the stub is emitted
+							const messageAge = unixTimestampSeconds() - toNumber(msg.messageTimestamp)
+							if (messageAge > PLACEHOLDER_MAX_AGE_SECONDS) {
+								logger.debug({ msgId: msg.key.id, messageAge }, 'skipping placeholder resend for old message')
+								acked = true
+								return sendMessageAck(node)
+							}
+
+							// Request the real content from the phone via placeholder resend PDO.
+							// Upsert the CIPHERTEXT stub as a placeholder (like WA Web's processPlaceholderMsg),
+							// and store the requestId in stubParameters[1] so users can correlate
+							// with the incoming PDO response event.
+							const cleanKey: proto.IMessageKey = {
+								remoteJid: msg.key.remoteJid,
+								fromMe: msg.key.fromMe,
+								id: msg.key.id,
+								participant: msg.key.participant
+							}
+							// Cache the original message metadata so the PDO response handler
+							// can preserve key fields (LID details etc.) that the phone may omit
+							const msgData: Partial<WAMessage> = {
+								key: msg.key,
+								messageTimestamp: msg.messageTimestamp,
+								pushName: msg.pushName,
+								participant: msg.participant,
+								verifiedBizName: msg.verifiedBizName
+							}
+							requestPlaceholderResend(cleanKey, msgData)
+								.then(requestId => {
+									if (requestId && requestId !== 'RESOLVED') {
+										logger.debug({ msgId: msg.key.id, requestId }, 'requested placeholder resend for unavailable message')
+										ev.emit('messages.update', [
+											{
+												key: msg.key,
+												update: { messageStubParameters: [NO_MESSAGE_FOUND_ERROR_TEXT, requestId] }
+											}
+										])
+									}
+								})
+								.catch(err => {
+									logger.warn({ err, msgId: msg.key.id }, 'failed to request placeholder resend for unavailable message')
+								})
+							acked = true
+							await sendMessageAck(node)
+							// Don't return — fall through to upsertMessage so the stub is emitted
+					}
 					} else {
 						// Skip retry for expired status messages (>24h old)
 						if (isJidStatusBroadcast(msg.key.remoteJid!)) {
@@ -1948,12 +1957,26 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		}
 	}
 
+	const handleStatus = async (node: BinaryNode) => {
+		try {
+			const from = node.attrs.from
+			if (from && (isJidGroup(from) || isJidStatusBroadcast(from)) && getBinaryNodeChild(node, 'enc')) {
+				await handleMessage(node)
+			} else {
+				await sendMessageAck(node)
+			}
+		} catch (error) {
+			onUnexpectedError(error instanceof Error ? error : new Error(String(error)), 'handling status stanza')
+		}
+	}
+
 	const offlineNodeProcessor = makeOfflineNodeProcessor(
 		new Map<MessageType, (node: BinaryNode) => Promise<void>>([
 			['message', handleMessage],
 			['call', handleCall],
 			['receipt', handleReceipt],
-			['notification', handleNotification]
+			['notification', handleNotification],
+			['status', handleStatus]
 		]),
 		{
 			isWsOpen: () => ws.isOpen,
@@ -2011,6 +2034,11 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	ws.on('CB:notification', async (node: BinaryNode) => {
 		await processNode('notification', node, 'handling notification', handleNotification)
 	})
+
+	ws.on('CB:status', async (node: BinaryNode) => {
+		await processNode('status', node, 'handling status', handleStatus)
+	})
+
 	ws.on('CB:ack,class:message', (node: BinaryNode) => {
 		handleBadAck(node).catch(error => onUnexpectedError(error, 'handling bad ack'))
 	})

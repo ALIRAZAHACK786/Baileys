@@ -744,6 +744,16 @@ export const generateWAMessageContent = async (
 		}
 	}
 
+	if (hasOptionalProperty(message, 'statusReactionParentKey') && !!message.statusReactionParentKey) {
+		m.messageContextInfo = {
+			...m.messageContextInfo,
+			messageAssociation: {
+				associationType: WAProto.MessageAssociation.AssociationType.STATUS_REACTION,
+				parentMessageKey: message.statusReactionParentKey
+			}
+		}
+	}
+
 	if (shouldIncludeReportingToken(m)) {
 		m.messageContextInfo = m.messageContextInfo || {}
 		if (!m.messageContextInfo.messageSecret) {
